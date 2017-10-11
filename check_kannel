@@ -25,7 +25,7 @@ use XML::DOM;
 use XML::XPath;
 use XML::XPath::XMLParser;
 use Getopt::Long;
-use vars qw($opt_V $opt_v $opt_P $opt_p $opt_h $opt_H $opt_s $opt_t $opt_w $opt_c $opt_i $opt_j $opt_k $opt_o $opt_q $opt_r $opt_l $opt_m $opt_S $opt_W %kannel %plugin $response $ua $xp $PROGNAME $PROGREV);
+use vars qw($opt_V $opt_v $opt_P $opt_p $opt_h $opt_H $opt_s $opt_t $opt_w $opt_c $opt_i $opt_j $opt_k $opt_o $opt_q $opt_r $opt_l $opt_m $opt_S $opt_W $opt_b $opt_B $opt_F $opt_T $smsboxwarn $smsboxwarnstatus $smsboxcritstatus $smsboxq @smscqwarn @smscqcrit $finaloutput $smsconlinecrit $smsconlinewarn $smscqcrit $smscqwarn $critstatus $warnstatus @downsmsc $storesizestatus %kannel %plugin $response $ua $xp $PROGNAME $PROGREV);
 use lib "/usr/lib/nagios/plugins";
 use utils qw($TIMEOUT %ERRORS &print_revision);
 
@@ -73,7 +73,8 @@ sub print_usage();
 					warning  => 0,
 					critical => 0
 				}
-			}
+			},
+			storesize => 0
 		},
 		dlr => {
 			queued => {
@@ -86,7 +87,8 @@ sub print_usage();
 				online => {
 					warning  => 1,
 					critical => 0
-				}
+				},
+				queued => ''
 			},
 			wapbox => {
 				online => {
@@ -151,7 +153,17 @@ sub print_usage();
 	},
 	smscs => {
 		count  => '',
-		online => 0
+		online => 0,
+		smsc => {
+		     status => '',
+		     "admin-id" => '',
+		     failed => '',
+		     queued => '',
+		     sms => {
+			 inbound => '',
+			 outbound => ''
+		    }
+		}
 	}
 );
 
@@ -176,6 +188,10 @@ GetOptions
 	 "t=i" => \$opt_t, "timeout=i"         => \$opt_t,
 	 "H=s" => \$opt_H, "host=s"            => \$opt_H,
 	 "P=i" => \$opt_P, "port=i"            => \$opt_P,
+	 "b=i" => \$opt_b, "smsboxwarn=i"      => \$opt_b, #set by mfouad to set smsbox count that should be connected
+	 "B=i" => \$opt_B, "smsboxcrit=i"      => \$opt_B, #set by mfouad to set smsbox count that should be connected
+	 "F=i" => \$opt_F, "smsboxq=i"         => \$opt_F, #set by mfouad to set smsbox queue
+	 "T=i" => \$opt_T, "storesize=i"       => \$opt_T, #set by mfouad to set smsbox queue
 	 "p=s" => \$opt_p, "password=s"        => \$opt_p);
 
 if ($opt_V)
@@ -242,7 +258,7 @@ if ($opt_i and $opt_i =~ /^([0-9]+)$/)
 
 if ($opt_j and $opt_j =~ /^([0-9]+)$/)
 {
-	$plugin{thresholds}{sms}{received}{queued}{warning} = $1;
+	$plugin{thresholds}{sms}{received}{queued}{critical} = $1;
 }
 
 if ($opt_o and $opt_o =~ /^([0-9]+)$/)
@@ -265,6 +281,22 @@ if ($opt_m and $opt_m =~ /^([0-9]+)$/)
 	$plugin{thresholds}{smscs}{queued}{critical} = $1;
 }
 
+if ($opt_b =~ /^([0-9]+)$/)
+{
+	$plugin{thresholds}{boxes}{smsbox}{online}{warning} = $1;
+}
+if ($opt_B =~ /^([0-9]+)$/)
+{
+	$plugin{thresholds}{boxes}{smsbox}{online}{critical} = $1;
+}
+if ($opt_F =~ /^([0-9]+)$/)
+{
+	$plugin{thresholds}{boxes}{smsbox}{queued} = $1;
+}
+if ($opt_T =~ /^([0-9]+)$/)
+{
+	$plugin{thresholds}{sms}{storesize} = $1;
+}
 if ($plugin{thresholds}{smscs}{online}{critical} > $plugin{thresholds}{smscs}{online}{warning})
 {
 	print "Fatal: Online SMSCs critical offset ($plugin{thresholds}{smscs}{online}{critical}) must be smaller than warning offset ($plugin{thresholds}{smscs}{online}{warning}).\n";
@@ -310,7 +342,7 @@ else
 }
 $ua->timeout(10);
 $ua->env_proxy;
- 
+
 $response = $ua->get($plugin{url});
 
 if ($response->is_success)
@@ -322,7 +354,7 @@ else
 	print "CRITICAL: Can't connect to Kannel: ".$response->status_line."\n";
 	exit $ERRORS{"CRITICAL"};
 }
- 
+
 $xp = XML::XPath->new(xml => $response->content);
 
 if ($xp->getNodeText("/gateway") =~ /Denied/)
@@ -341,6 +373,8 @@ $kannel{sms}{storesize} = $xp->getNodeText("/gateway/sms/storesize");
 $kannel{dlr}{queued} = $xp->getNodeText("/gateway/dlr/queued");
 $kannel{dlr}{storage} = $xp->getNodeText("/gateway/dlr/storage");
 $kannel{smscs}{count} = $xp->getNodeText("/gateway/smscs/count");
+#$kannel{smscs}{smsc}{sms}{inbound} = $xp->getNodeText("/gateway/smscs/smsc/sms/inbound");
+#$kannel{smscs}{smsc}{sms}{outbound} = $xp->getNodeText("/gateway/smscs/smsc/sms/outbound");
 
 # Get number of total/online sms/wap boxes
 foreach my $box ($xp->findnodes("/gateway/boxes/box"))
@@ -353,13 +387,13 @@ foreach my $box ($xp->findnodes("/gateway/boxes/box"))
 	if ($type->string_value eq "smsbox")
 	{
 		$kannel{boxes}{smsbox}{count}++;
-		
+
 		if ($status->string_value =~ /^on-line/)
 		{
 			$kannel{boxes}{smsbox}{online}++;
 		}
-	# wapboxes
 	}
+	# wapboxes
 	elsif ($type->string_value eq "wapbox")
 	{
 		$kannel{boxes}{wapbox}{count}++;
@@ -376,73 +410,92 @@ foreach my $smsc ($xp->findnodes("/gateway/smscs/smsc"))
 {
     my $status = $smsc->findnodes("status");
     my $queued = $smsc->findnodes("queued");
-    my $id = $smsc->findnodes("id")->string_value;
-
+    my $id = $smsc->findnodes("admin-id")->string_value;
+    my $inbound =  $smsc->findnodes("sms/inbound")->string_value;
+    my $outbound =  $smsc->findnodes("sms/outbound")->string_value;
     # onlines
 	if ($status->string_value =~ /^online/)
 	{
 		$kannel{smscs}{online}++;
 	}
-
-    # queued
-    $kannel{smscs}{$id}{queued} = $queued->string_value;
+	else {
+		push (@downsmsc, $id);
 }
+
+    # catching queued values
+    $kannel{smscs}{$id}{queued} = $queued->string_value;
+    #catching throughput in & out
+    $kannel{smscs}{$id}{sms}{inbound} = $inbound;
+    $kannel{smscs}{$id}{sms}{outbound} = $outbound;
+}
+##check for store storage size
+
+if ( $plugin{thresholds}{sms}{storesize} > 0 and $plugin{thresholds}{sms}{storesize}  < $kannel{sms}{storesize} )
+{
+	$storesizestatus = "Storesize Warning! store:$kannel{sms}{storesize}/$plugin{thresholds}{sms}{storesize} configured"
+}
+
 
 # Kannel running
 if ($kannel{status} eq 'running')
 {
 
-	# smsboxes connected
-	if ($plugin{check}{smsbox} and $kannel{boxes}{smsbox}{online} >= 0 and $kannel{boxes}{smsbox}{online} <= $plugin{thresholds}{boxes}{smsbox}{online}{critical})
+	# smsboxes connected only used critical so removed the "=" from below equation  $kannel{boxes}{smsbox}{online} <= $plugin{thresholds}{boxes}{smsbox}{online}{critical}
+	if ($plugin{check}{smsbox} and $kannel{boxes}{smsbox}{online} >= 0 and $kannel{boxes}{smsbox}{online} < $plugin{thresholds}{boxes}{smsbox}{online}{critical})
 	{
-
-		exit print_output('CRITICAL');
+		$smsboxcritstatus = "SMSBox Critial threshold! Online Boxes is $kannel{boxes}{smsbox}{online}/$plugin{thresholds}{boxes}{smsbox}{online}{critical} configured";
+#		exit print_output('CRITICAL');
 
 	}
 	elsif ($kannel{boxes}{smsbox}{online} >= $plugin{thresholds}{boxes}{smsbox}{online}{critical} and $kannel{boxes}{smsbox}{online} <= $plugin{thresholds}{boxes}{smsbox}{online}{warning} and $kannel{boxes}{smsbox}{online} > 1)
-	{
-		exit print_output('WARNING');
+	{ ## NOT USED FOR US RIGHT NOW
+		$smsboxwarnstatus = "SMSBox Warning threshold! Online Boxes is  $kannel{boxes}{smsbox}{online}/$plugin{thresholds}{boxes}{smsbox}{online}{warning} configured";
+#		exit print_output('WARNING');
 	}
 
 	# wapboxes running
 	if ($plugin{check}{wapbox} and $kannel{boxes}{wapbox}{online} >= 0 and $kannel{boxes}{wapbox}{online} <= $plugin{thresholds}{boxes}{wapbox}{online}{critical})
 	{
-
-		exit print_output('CRITICAL');
+#		$critstatus = 1;
+#		exit print_output('CRITICAL');
 
 	}
 	elsif ($kannel{boxes}{wapbox}{online} >= $plugin{thresholds}{boxes}{wapbox}{online}{critical} and $kannel{boxes}{wapbox}{online} <= $plugin{thresholds}{boxes}{wapbox}{online}{warning} and $kannel{boxes}{wapbox}{online} > 1)
 	{
-
-		exit print_output('WARNING');
+#		$warnstatus = 1;
+#		exit print_output('WARNING');
 
 	}
 
 	# smscs online
 	if ($kannel{smscs}{online} >= 0 and $kannel{smscs}{online} <= $plugin{thresholds}{smscs}{online}{critical})
 	{
-
-		exit print_output('CRITICAL');
-
+		$smsconlinecrit = "SMSC Critial threshold! Online SMSCc is $kannel{smscs}{online}/$plugin{thresholds}{smscs}{online}{critical} configured";
+#		$critstatus = 1;
+#		exit print_output('CRITICAL');
 	}
 	elsif ($kannel{smscs}{online} >= $plugin{thresholds}{smscs}{online}{critical} and $kannel{smscs}{online} <= $plugin{thresholds}{smscs}{online}{warning} and $kannel{smscs}{online} > 1)
 	{
-		exit print_output('WARNING');
+		$smsconlinewarn = "SMSC Warning threshold! Online SMSCc is $kannel{smscs}{online}/$plugin{thresholds}{smscs}{online}{warning} configured";
+#		$warnstatus = 1;
+#		exit print_output('WARNING');
 	}
-
 	# smscs queued
     foreach my $id (keys %{$kannel{smscs}})
     {
         next if ($id eq 'online' || $id eq 'count');
         if ($kannel{smscs}{$id}{queued} >= $plugin{thresholds}{smscs}{queued}{critical})
 	    {
-
-	    	exit print_output('CRITICAL');
+		push (@smscqcrit, "$id: $kannel{smscs}{$id}{queued} / Inbound: $kannel{smscs}{$id}{sms}{inbound} / Outbound:$kannel{smscs}{$id}{sms}{outbound}");
+#		$smscqcrit = "Queue/SMSC Critical!";
+#	    	exit print_output('CRITICAL');
 
 	    }
 	    elsif ($kannel{smscs}{$id}{queued} < $plugin{thresholds}{smscs}{queued}{critical} and $kannel{smscs}{$id}{queued} >= $plugin{thresholds}{smscs}{queued}{warning})
 	    {
-	    	exit print_output('WARNING');
+		push (@smscqwarn, "$id: $kannel{smscs}{$id}{queued} / Inbound: $kannel{smscs}{$id}{sms}{inbound} / Outbound:$kannel{smscs}{$id}{sms}{outbound}");
+#		$smscqwarn = "Queue/SMSC Warning!";
+#	    	exit print_output('WARNING');
 	    }
     }
 
@@ -450,7 +503,8 @@ if ($kannel{status} eq 'running')
 	{
 		if ($kannel{sms}{received}{queued} > $plugin{thresholds}{sms}{received}{queued}{critical} or $kannel{sms}{sent}{queued} > $plugin{thresholds}{sms}{sent}{queued}{critical})
 		{
-			exit print_output('CRITICAL');
+			$critstatus = 1;
+#			exit print_output('CRITICAL');
 		}
 	}
 
@@ -459,37 +513,81 @@ if ($kannel{status} eq 'running')
 
 		if ($kannel{sms}{received}{queued} > $plugin{thresholds}{sms}{received}{queued}{warning} or $kannel{sms}{sent}{queued} > $plugin{thresholds}{sms}{sent}{queued}{warning})
 		{
-			exit print_output('WARNING');
+			$warnstatus = 1;
+#			exit print_output('WARNING');
 		}
 
 	}
 	else
 	{
-		exit print_output('OK');
+		$finaloutput = 'OK';
+#		exit print_output('OK');
 	}
 
 }
 elsif ($kannel{status} =~ /^(suspended|isolated|full|shutdown)/)
 {
-	exit print_output('WARNING');
+	$warnstatus = 1;
+#	exit print_output('WARNING');
 }
 else
 {
-	exit print_output('CRITICAL');
+	$warnstatus = 1;
+#	exit print_output('CRITICAL');
 }
 
 #### subs
 
+if ($smsboxwarnstatus || $smsconlinewarn || @smscqwarn || $storesizestatus ){
+exit print_output('WARNING');
+}
+elsif ( $smsboxcritstatus || $smsconlinecrit || @smscqcrit ){
+exit print_output('CRITICAL');
+}
+else {exit print_output('OK');}
+
 sub print_output($)
 {
 	my $state = shift;
-	print "Kannel $state - $kannel{status},$kannel{uptime}, $kannel{boxes}{smsbox}{online}/$kannel{boxes}{smsbox}{count} SMSBOX, $kannel{boxes}{wapbox}{online}/$kannel{boxes}{wapbox}{count} WAPBOX, $kannel{smscs}{online}/$kannel{smscs}{count} SMSC, $kannel{sms}{received}{queued}/$kannel{sms}{sent}{queued} SMS queued in/out, $kannel{dlr}{queued} DLR queued ($kannel{dlr}{storage}), store-file $kannel{sms}{storesize} bytes\n";
-    print "SMSC queues:";
-    foreach my $id (keys %{$kannel{smscs}})
-    {
-        next if ($id eq 'online' || $id eq 'count');
-        print " $id: $kannel{smscs}{$id}{queued}";
-    }
+	print "Kannel $state - $kannel{status},$kannel{uptime}, $kannel{boxes}{smsbox}{online}/$kannel{boxes}{smsbox}{count} SMSBOX, $kannel{boxes}{wapbox}{online}/$kannel{boxes}{wapbox}{count} WAPBOX, $kannel{smscs}{online}/$kannel{smscs}{count} SMSC, $kannel{sms}{received}{queued}/$kannel{sms}{sent}{queued} SMS queued in/out, $kannel{dlr}{queued} DLR queued ($kannel{dlr}{storage}), store-file $kannel{sms}{storesize} bytes \n\n";
+
+
+if ($smsboxcritstatus) {
+	print "$smsboxcritstatus\n";
+}
+elsif ($smsboxwarnstatus){ ##NOT USED, shouldn't be viewed
+	print "$smsboxwarnstatus\n"
+}
+
+if ($smsconlinecrit) {
+print "$smsconlinecrit\n";
+}
+if ($smsconlinewarn) {
+print "$smsconlinewarn\n";
+}
+if (@downsmsc) {
+print "Down SMSCs:\n";
+print join("\n",@downsmsc),"\n";
+}
+if (@smscqwarn){
+print "\nQueue/SMSC Warning!.. SMSCs:\n";
+print join("\n",@smscqwarn),"\n";
+}
+if (@smscqcrit){
+print "\nQueue/SMSC Critical!.. SMSCs:\n";
+print join("\n",@smscqcrit),"\n";
+}
+
+if ($storesizestatus){
+print "$storesizestatus\n"
+}
+
+#print "SMSC queues: \n";
+#    foreach my $id (keys %{$kannel{smscs}})
+#    {
+#        next if ($id eq 'online' || $id eq 'count');
+#        print " $id: $kannel{smscs}{$id}{queued}";
+#    }
     print "\n";
 	return $ERRORS{"$state"};
 }
@@ -512,38 +610,47 @@ sub print_help()
 -w (--warning)
      Number of connected SMSCs below which a warning status will be generated.
      Defaults to 1.
--c (--critical) 
+-c (--critical)
      Number of connected SMSCs below which a critical status will be generated.
      Defaults to 0.
+-b (--smsboxwarn)
+     Number of smsboxes that should be connected, if online boxes below, a Warning status will be generated.
+-B (--smsboxcrit)
+     Number of smsboxes that should be connected, if online boxes below, a Critical status will be generated.
+-F (--smsboxq)
+     Number of queue at smsboxes greater, a Critical status will be generated.
 -S (--smsbox)
-     Consider absence of at least a SMSBOX process a critical condition.
+     Consider absence of at least a SMSBOX process a critical condition.. make use of smsboxwarn.
      Defaults to false.
--W (--wapbox) 
+-W (--wapbox)
      Consider absence of at least a WAPBOX process a critical condition.
      Defaults to false.
 -i (--smsrecvqwarn)
      Number of SMSs in the receive queue above which a warning status will be generated.
      Defaults to 0.
--j (--smsrecvqcrit)	
+-j (--smsrecvqcrit)
      Number of SMSs in the receive queue above which a critical status will be generated.
      Defaults to 0.
--k (--smsrecvrate)	
+-T (--storesize)
+     Size of the store storage above which a critical status will be generated.
+     Defaults to 0 not checking.
+-k (--smsrecvrate)
      Receive rate of SMSs below which a critical status will be generated.
      Defaults to 0.
 -o (--smssendqwarn)
      Number of SMSs in the receive queue above which a warning status will be generated.
      Defaults to 0.
--q (--smssendqcrit)	
+-q (--smssendqcrit)
      Number of SMSs in the receive queue above which a critical status will be generated.
      Defaults to 0.
--r (--smssendrate)	
+-r (--smssendrate)
      Send rate of SMSs below which a critical status will be generated.
      Defaults to 0.
--l (--smscqueuedwarn) 
+-l (--smscqueuedwarn)
      Number of SMSs queued for sending for a given connection which a warning status will be generated.
 -m (--smscqueuedcrit)
      Number of SMSs queued for sending for a given connection which a critical status will be generated.
--t (--timeout) 
+-t (--timeout)
      Timeout in seconds at which an unknown status will be generated.
      Defaults to $TIMEOUT.
 -s (--secure)
@@ -558,6 +665,6 @@ sub print_help()
 -p (--password)
      Password needed to access the status interface.
      Defaults to blank (no password).
-\n";	
+\n";
 
 }
